@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>News Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #1a1d24;
+    --border: #2a2e38;
+    --text: #e8e8ea;
+    --muted: #9098a8;
+    --accent: #4f8dfd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  #login-screen {
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 16px;
+  }
+  #login-screen input {
+    padding: 12px 16px;
+    font-size: 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    width: 260px;
+  }
+  #login-screen button, .btn {
+    padding: 12px 20px;
+    font-size: 15px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: white;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #login-error { color: #ff6b6b; font-size: 14px; min-height: 20px; }
+
+  #app { display: none; max-width: 900px; margin: 0 auto; padding: 16px; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  #refresh-btn { display: flex; align-items: center; gap: 8px; }
+  #last-updated { font-size: 12px; color: var(--muted); }
+
+  .filter-row { margin-bottom: 12px; }
+  .filter-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .chip.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+  #article-count { font-size: 13px; color: var(--muted); margin: 12px 0 8px; }
+
+  .article {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+  .article-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .tag {
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #262a34;
+  }
+  .article-title { font-size: 16px; font-weight: 600; margin: 4px 0 6px; }
+  .article-summary { font-size: 14px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
+  .article a {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  #loading, #empty { text-align: center; color: var(--muted); padding: 40px 0; }
+  .spin { animation: spin 1s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <h2>🔒 News Dashboard</h2>
+  <input type="password" id="password-input" placeholder="Enter password" autofocus>
+  <button onclick="login()">Enter</button>
+  <div id="login-error"></div>
+</div>
+
+<div id="app">
+  <header>
+    <h1>📰 News Dashboard</h1>
+    <div>
+      <button class="btn" id="refresh-btn" onclick="manualRefresh()">↻ Refresh Now</button>
+    </div>
+  </header>
+  <div id="last-updated"></div>
+
+  <div class="filter-row">
+    <div class="filter-label">REGION</div>
+    <div class="chip-row" id="region-chips"></div>
+  </div>
+  <div class="filter-row">
+    <div class="filter-label">SECTOR</div>
+    <div class="chip-row" id="sector-chips"></div>
+  </div>
+
+  <div id="article-count"></div>
+  <div id="articles-container"></div>
+</div>
+
+<script>
+// ---- CONFIG: point this at your deployed Cloud Run backend URL ----
+const API_BASE = "https://news-app-api-344915366716.asia-south1.run.app";
+
+let PASSWORD = "";
+let currentRegion = "All";
+let currentSector = "All";
+let autoRefreshTimer = null;
+
+function login() {
+  const input = document.getElementById("password-input");
+  PASSWORD = input.value;
+  document.getElementById("login-error").textContent = "";
+  verifyAndEnter();
+}
+
+document.getElementById("password-input").addEventListener("keydown", e => {
+  if (e.key === "Enter") login();
+});
+
+async function verifyAndEnter() {
+  try {
+    const res = await fetch(`${API_BASE}/meta?password=${encodeURIComponent(PASSWORD)}`);
+    if (res.status === 401) {
+      document.getElementById("login-error").textContent = "Wrong password.";
+      return;
+    }
+    const data = await res.json();
+    sessionStorage.setItem("news_app_password", PASSWORD);
+    buildFilterChips(data.regions, data.sectors);
+    document.getElementById("login-screen").style.display = "none";
+    document.getElementById("app").style.display = "block";
+    loadArticles();
+    autoRefreshTimer = setInterval(loadArticles, 5 * 60 * 1000); // refresh view every 5 min
+  } catch (e) {
+    document.getElementById("login-error").textContent = "Could not reach server. Check API_BASE URL.";
+  }
+}
+
+function buildFilterChips(regions, sectors) {
+  const regionRow = document.getElementById("region-chips");
+  const sectorRow = document.getElementById("sector-chips");
+  regionRow.innerHTML = "";
+  sectorRow.innerHTML = "";
+
+  ["All", ...regions].forEach(r => {
+    const chip = document.createElement("div");
+    chip.className = "chip" + (r === "All" ? " active" : "");
+    chip.textContent = r;
+    chip.onclick = () => { currentRegion = r; updateActiveChip(regionRow, chip); loadArticles(); };
+    regionRow.appendChild(chip);
+  });
+
+  ["All", ...sectors].forEach(s => {
+    const chip = document.createElement("div");
+    chip.className = "chip" + (s === "All" ? " active" : "");
+    chip.textContent = s;
+    chip.onclick = () => { currentSector = s; updateActiveChip(sectorRow, chip); loadArticles(); };
+    sectorRow.appendChild(chip);
+  });
+}
+
+function updateActiveChip(row, activeChip) {
+  [...row.children].forEach(c => c.classList.remove("active"));
+  activeChip.classList.add("active");
+}
+
+async function loadArticles() {
+  const container = document.getElementById("articles-container");
+  container.innerHTML = `<div id="loading">Loading...</div>`;
+
+  const params = new URLSearchParams({
+    password: PASSWORD,
+    region: currentRegion,
+    sector: currentSector,
+  });
+
+  try {
+    const res = await fetch(`${API_BASE}/articles?${params}`);
+    const data = await res.json();
+    renderArticles(data.articles);
+    document.getElementById("article-count").textContent = `${data.count} articles`;
+    document.getElementById("last-updated").textContent =
+      "Last checked: " + new Date().toLocaleTimeString();
+  } catch (e) {
+    container.innerHTML = `<div id="empty">Failed to load articles.</div>`;
+  }
+}
+
+function renderArticles(articles) {
+  const container = document.getElementById("articles-container");
+  if (!articles.length) {
+    container.innerHTML = `<div id="empty">No articles match this filter yet.</div>`;
+    return;
+  }
+  container.innerHTML = articles.map(a => `
+    <div class="article">
+      <div class="article-meta">
+        <span class="tag">${a.source}</span>
+        <span class="tag">${a.region}</span>
+        <span class="tag">${a.sector}</span>
+        <span>${new Date(a.published).toLocaleString()}</span>
+      </div>
+      <div class="article-title">${escapeHtml(a.title)}</div>
+      <div class="article-summary">${escapeHtml(stripHtml(a.summary))}</div>
+      <a href="${a.link}" target="_blank" rel="noopener">Read full article →</a>
+    </div>
+  `).join("");
+}
+
+function stripHtml(html) {
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  return tmp.textContent || tmp.innerText || "";
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+async function manualRefresh() {
+  const btn = document.getElementById("refresh-btn");
+  btn.innerHTML = `<span class="spin">↻</span> Fetching...`;
+  try {
+    await fetch(`${API_BASE}/fetch?password=${encodeURIComponent(PASSWORD)}`, { method: "POST" });
+    await loadArticles();
+  } catch (e) {
+    alert("Refresh failed. Check connection.");
+  }
+  btn.innerHTML = "↻ Refresh Now";
+}
+
+// auto-login if password already in this session
+window.addEventListener("load", () => {
+  const saved = sessionStorage.getItem("news_app_password");
+  if (saved) {
+    PASSWORD = saved;
+    verifyAndEnter();
+  }
+});
+</script>
+
+</body>
+</html>
