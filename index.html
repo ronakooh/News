@@ -54,17 +54,27 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
     flex-wrap: wrap;
     gap: 10px;
   }
   h1 { font-size: 20px; margin: 0; }
-  #refresh-btn { display: flex; align-items: center; gap: 8px; }
-  #last-updated { font-size: 12px; color: var(--muted); }
+  #last-updated { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+
+  #search-box {
+    width: 100%;
+    padding: 10px 14px;
+    font-size: 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    margin-bottom: 14px;
+  }
 
   .filter-row { margin-bottom: 12px; }
   .filter-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; max-height: 90px; overflow-y: auto; }
   .chip {
     padding: 6px 12px;
     border-radius: 999px;
@@ -77,16 +87,33 @@
   }
   .chip.active { background: var(--accent); color: white; border-color: var(--accent); }
 
-  #article-count { font-size: 13px; color: var(--muted); margin: 12px 0 8px; }
+  #story-count { font-size: 13px; color: var(--muted); margin: 14px 0 8px; }
 
-  .article {
+  .hour-group { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+  .hour-header {
+    padding: 12px 16px;
     background: var(--panel);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .hour-header .count { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .hour-body { display: none; padding: 10px; }
+  .hour-body.open { display: block; }
+  .hour-arrow { transition: transform 0.15s; }
+  .hour-arrow.open { transform: rotate(90deg); }
+
+  .story {
+    background: #14161c;
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 14px 16px;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
   }
-  .article-meta {
+  .story-meta {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
@@ -94,19 +121,12 @@
     color: var(--muted);
     margin-bottom: 6px;
   }
-  .tag {
-    padding: 2px 8px;
-    border-radius: 999px;
-    background: #262a34;
-  }
-  .article-title { font-size: 16px; font-weight: 600; margin: 4px 0 6px; }
-  .article-summary { font-size: 14px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
-  .article a {
-    color: var(--accent);
-    text-decoration: none;
-    font-size: 13px;
-    font-weight: 600;
-  }
+  .tag { padding: 2px 8px; border-radius: 999px; background: #262a34; }
+  .story-title { font-size: 16px; font-weight: 600; margin: 4px 0 6px; }
+  .story-summary { font-size: 14px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
+  .source-links { display: flex; flex-wrap: wrap; gap: 10px; }
+  .source-links a { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600; }
+
   #loading, #empty { text-align: center; color: var(--muted); padding: 40px 0; }
   .spin { animation: spin 1s linear infinite; display: inline-block; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -124,11 +144,11 @@
 <div id="app">
   <header>
     <h1>📰 News Dashboard</h1>
-    <div>
-      <button class="btn" id="refresh-btn" onclick="manualRefresh()">↻ Refresh Now</button>
-    </div>
+    <button class="btn" id="refresh-btn" onclick="manualRefresh()">↻ Refresh Now</button>
   </header>
   <div id="last-updated"></div>
+
+  <input type="text" id="search-box" placeholder="Search headlines..." oninput="onSearchInput()">
 
   <div class="filter-row">
     <div class="filter-label">REGION</div>
@@ -138,19 +158,25 @@
     <div class="filter-label">SECTOR</div>
     <div class="chip-row" id="sector-chips"></div>
   </div>
+  <div class="filter-row">
+    <div class="filter-label">SOURCE</div>
+    <div class="chip-row" id="source-chips"></div>
+  </div>
 
-  <div id="article-count"></div>
-  <div id="articles-container"></div>
+  <div id="story-count"></div>
+  <div id="groups-container"></div>
 </div>
 
 <script>
-// ---- CONFIG: point this at your deployed Cloud Run backend URL ----
+// ---- CONFIG: your deployed Cloud Run backend URL ----
 const API_BASE = "https://news-app-api-344915366716.asia-south1.run.app";
 
 let PASSWORD = "";
 let currentRegion = "All";
 let currentSector = "All";
-let autoRefreshTimer = null;
+let currentSource = "All";
+let searchDebounceTimer = null;
+let openHourKeys = new Set(); // tracks which hour groups are expanded
 
 function login() {
   const input = document.getElementById("password-input");
@@ -172,85 +198,149 @@ async function verifyAndEnter() {
     }
     const data = await res.json();
     sessionStorage.setItem("news_app_password", PASSWORD);
-    buildFilterChips(data.regions, data.sectors);
+    buildFilterChips(data.regions, data.sectors, data.sources);
     document.getElementById("login-screen").style.display = "none";
     document.getElementById("app").style.display = "block";
-    loadArticles();
-    autoRefreshTimer = setInterval(loadArticles, 5 * 60 * 1000); // refresh view every 5 min
+    loadStories();
+    setInterval(loadStories, 5 * 60 * 1000);
   } catch (e) {
     document.getElementById("login-error").textContent = "Could not reach server. Check API_BASE URL.";
   }
 }
 
-function buildFilterChips(regions, sectors) {
-  const regionRow = document.getElementById("region-chips");
-  const sectorRow = document.getElementById("sector-chips");
-  regionRow.innerHTML = "";
-  sectorRow.innerHTML = "";
+function buildFilterChips(regions, sectors, sources) {
+  buildChipRow("region-chips", regions, v => { currentRegion = v; loadStories(); });
+  buildChipRow("sector-chips", sectors, v => { currentSector = v; loadStories(); });
+  buildChipRow("source-chips", sources, v => { currentSource = v; loadStories(); });
+}
 
-  ["All", ...regions].forEach(r => {
+function buildChipRow(containerId, values, onSelect) {
+  const row = document.getElementById(containerId);
+  row.innerHTML = "";
+  ["All", ...values].forEach(v => {
     const chip = document.createElement("div");
-    chip.className = "chip" + (r === "All" ? " active" : "");
-    chip.textContent = r;
-    chip.onclick = () => { currentRegion = r; updateActiveChip(regionRow, chip); loadArticles(); };
-    regionRow.appendChild(chip);
-  });
-
-  ["All", ...sectors].forEach(s => {
-    const chip = document.createElement("div");
-    chip.className = "chip" + (s === "All" ? " active" : "");
-    chip.textContent = s;
-    chip.onclick = () => { currentSector = s; updateActiveChip(sectorRow, chip); loadArticles(); };
-    sectorRow.appendChild(chip);
+    chip.className = "chip" + (v === "All" ? " active" : "");
+    chip.textContent = v;
+    chip.onclick = () => {
+      [...row.children].forEach(c => c.classList.remove("active"));
+      chip.classList.add("active");
+      onSelect(v);
+    };
+    row.appendChild(chip);
   });
 }
 
-function updateActiveChip(row, activeChip) {
-  [...row.children].forEach(c => c.classList.remove("active"));
-  activeChip.classList.add("active");
+function onSearchInput() {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(loadStories, 400);
 }
 
-async function loadArticles() {
-  const container = document.getElementById("articles-container");
+async function loadStories() {
+  const container = document.getElementById("groups-container");
   container.innerHTML = `<div id="loading">Loading...</div>`;
 
+  const search = document.getElementById("search-box").value.trim();
   const params = new URLSearchParams({
     password: PASSWORD,
     region: currentRegion,
     sector: currentSector,
+    source: currentSource,
+    search: search,
   });
 
   try {
     const res = await fetch(`${API_BASE}/articles?${params}`);
     const data = await res.json();
-    renderArticles(data.articles);
-    document.getElementById("article-count").textContent = `${data.count} articles`;
+    renderGroupedStories(data.stories);
+    document.getElementById("story-count").textContent = `${data.count} stories`;
     document.getElementById("last-updated").textContent =
       "Last checked: " + new Date().toLocaleTimeString();
   } catch (e) {
-    container.innerHTML = `<div id="empty">Failed to load articles.</div>`;
+    container.innerHTML = `<div id="empty">Failed to load stories.</div>`;
   }
 }
 
-function renderArticles(articles) {
-  const container = document.getElementById("articles-container");
-  if (!articles.length) {
-    container.innerHTML = `<div id="empty">No articles match this filter yet.</div>`;
+function hourKeyAndLabel(dateObj) {
+  const start = new Date(dateObj);
+  start.setMinutes(0, 0, 0);
+  const end = new Date(start);
+  end.setHours(end.getHours() + 1);
+  const key = start.toISOString().slice(0, 13); // groups by local-independent hour bucket key
+  const fmt = d => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const label = `${fmt(start)} – ${fmt(end)}`;
+  return { key, label, sortTime: start.getTime() };
+}
+
+function renderGroupedStories(stories) {
+  const container = document.getElementById("groups-container");
+  if (!stories.length) {
+    container.innerHTML = `<div id="empty">No stories match this filter yet.</div>`;
     return;
   }
-  container.innerHTML = articles.map(a => `
-    <div class="article">
-      <div class="article-meta">
-        <span class="tag">${a.source}</span>
-        <span class="tag">${a.region}</span>
-        <span class="tag">${a.sector}</span>
-        <span>${new Date(a.published).toLocaleString()}</span>
+
+  const groups = {}; // key -> { label, sortTime, stories: [] }
+  stories.forEach(s => {
+    const localDate = new Date(s.published);
+    const { key, label, sortTime } = hourKeyAndLabel(localDate);
+    if (!groups[key]) groups[key] = { label, sortTime, stories: [] };
+    groups[key].stories.push(s);
+  });
+
+  const sortedKeys = Object.keys(groups).sort((a, b) => groups[b].sortTime - groups[a].sortTime);
+
+  // default: only the most recent hour is open, unless the user has toggled something already
+  if (openHourKeys.size === 0) {
+    openHourKeys.add(sortedKeys[0]);
+  }
+
+  container.innerHTML = sortedKeys.map(key => {
+    const group = groups[key];
+    const isOpen = openHourKeys.has(key);
+    return `
+      <div class="hour-group">
+        <div class="hour-header" onclick="toggleHour('${key}')">
+          <span><span class="hour-arrow ${isOpen ? 'open' : ''}" id="arrow-${key}">▶</span> ${group.label}</span>
+          <span class="count">${group.stories.length} stories</span>
+        </div>
+        <div class="hour-body ${isOpen ? 'open' : ''}" id="body-${key}">
+          ${group.stories.map(renderStoryCard).join("")}
+        </div>
       </div>
-      <div class="article-title">${escapeHtml(a.title)}</div>
-      <div class="article-summary">${escapeHtml(stripHtml(a.summary))}</div>
-      <a href="${a.link}" target="_blank" rel="noopener">Read full article →</a>
+    `;
+  }).join("");
+}
+
+function toggleHour(key) {
+  const body = document.getElementById(`body-${key}`);
+  const arrow = document.getElementById(`arrow-${key}`);
+  if (openHourKeys.has(key)) {
+    openHourKeys.delete(key);
+    body.classList.remove("open");
+    arrow.classList.remove("open");
+  } else {
+    openHourKeys.add(key);
+    body.classList.add("open");
+    arrow.classList.add("open");
+  }
+}
+
+function renderStoryCard(s) {
+  const sourceLinks = s.sources.map(src =>
+    `<a href="${src.link}" target="_blank" rel="noopener">${escapeHtml(src.name)} →</a>`
+  ).join("");
+
+  return `
+    <div class="story">
+      <div class="story-meta">
+        <span class="tag">${s.regions.join(", ")}</span>
+        <span class="tag">${s.sector}</span>
+        <span>${new Date(s.published).toLocaleString()}</span>
+      </div>
+      <div class="story-title">${escapeHtml(s.title)}</div>
+      <div class="story-summary">${escapeHtml(stripHtml(s.summary))}</div>
+      <div class="source-links">${sourceLinks}</div>
     </div>
-  `).join("");
+  `;
 }
 
 function stripHtml(html) {
@@ -270,14 +360,14 @@ async function manualRefresh() {
   btn.innerHTML = `<span class="spin">↻</span> Fetching...`;
   try {
     await fetch(`${API_BASE}/fetch?password=${encodeURIComponent(PASSWORD)}`, { method: "POST" });
-    await loadArticles();
+    openHourKeys.clear(); // reset to "only current hour open" after a fresh fetch
+    await loadStories();
   } catch (e) {
     alert("Refresh failed. Check connection.");
   }
   btn.innerHTML = "↻ Refresh Now";
 }
 
-// auto-login if password already in this session
 window.addEventListener("load", () => {
   const saved = sessionStorage.getItem("news_app_password");
   if (saved) {
