@@ -74,7 +74,8 @@
 
   .filter-row { margin-bottom: 12px; }
   .filter-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; max-height: 90px; overflow-y: auto; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; max-height: 120px; overflow-y: auto; }
+  .chip-row.no-scroll { max-height: none; overflow: visible; }
   .chip {
     padding: 6px 12px;
     border-radius: 999px;
@@ -84,8 +85,20 @@
     font-size: 13px;
     cursor: pointer;
     white-space: nowrap;
+    user-select: none;
   }
   .chip.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+  .view-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    align-items: flex-end;
+    margin-bottom: 4px;
+  }
+  .expand-links { display: none; gap: 12px; font-size: 12px; margin-left: auto; align-self: center; }
+  .expand-links.show { display: flex; }
+  .expand-links a { color: var(--accent); cursor: pointer; text-decoration: none; }
 
   #story-count { font-size: 13px; color: var(--muted); margin: 14px 0 8px; }
 
@@ -103,7 +116,7 @@
   .hour-header .count { color: var(--muted); font-weight: 400; font-size: 12px; }
   .hour-body { display: none; padding: 10px; }
   .hour-body.open { display: block; }
-  .hour-arrow { transition: transform 0.15s; }
+  .hour-arrow { display: inline-block; transition: transform 0.15s; }
   .hour-arrow.open { transform: rotate(90deg); }
 
   .story {
@@ -126,6 +139,17 @@
   .story-summary { font-size: 14px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
   .source-links { display: flex; flex-wrap: wrap; gap: 10px; }
   .source-links a { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600; }
+
+  #more-wrap { text-align: center; margin: 14px 0 30px; }
+  #more-btn {
+    padding: 10px 22px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+  }
 
   #loading, #empty { text-align: center; color: var(--muted); padding: 40px 0; }
   .spin { animation: spin 1s linear infinite; display: inline-block; }
@@ -150,6 +174,21 @@
 
   <input type="text" id="search-box" placeholder="Search headlines..." oninput="onSearchInput()">
 
+  <div class="view-bar">
+    <div class="filter-row">
+      <div class="filter-label">DAY</div>
+      <div class="chip-row no-scroll" id="day-chips"></div>
+    </div>
+    <div class="filter-row">
+      <div class="filter-label">VIEW</div>
+      <div class="chip-row no-scroll" id="view-chips"></div>
+    </div>
+    <div class="expand-links" id="expand-links">
+      <a onclick="setAllHours(true)">Expand all</a>
+      <a onclick="setAllHours(false)">Collapse all</a>
+    </div>
+  </div>
+
   <div class="filter-row">
     <div class="filter-label">REGION</div>
     <div class="chip-row" id="region-chips"></div>
@@ -165,22 +204,35 @@
 
   <div id="story-count"></div>
   <div id="groups-container"></div>
+  <div id="more-wrap" style="display:none">
+    <button id="more-btn" onclick="showMore()">Show more</button>
+  </div>
 </div>
 
 <script>
 // ---- CONFIG: your deployed Cloud Run backend URL ----
 const API_BASE = "https://news-app-api-344915366716.asia-south1.run.app";
+const PAGE_SIZE = 100; // stories drawn at a time in the "All stories" view
 
 let PASSWORD = "";
 let currentRegion = "All";
 let currentSector = "All";
 let currentSource = "All";
+let currentDay = "today";     // "today" | "yesterday" | "all"
+let currentView = "all";      // "all" (whole day, one list) | "hour" (hourly dropdowns)
 let searchDebounceTimer = null;
-let openHourKeys = new Set(); // tracks which hour groups are expanded
 
+let allStories = [];          // everything the server returned for the current filters
+let flatLimit = PAGE_SIZE;
+let openHourKeys = new Set(); // which hour groups are expanded
+let hoursTouched = false;     // true once the user opens/closes an hour by hand
+
+const DAY_OPTIONS = [["today", "Today"], ["yesterday", "Yesterday"], ["all", "Last 48h"]];
+const VIEW_OPTIONS = [["all", "All stories"], ["hour", "By hour"]];
+
+// ---------- login ----------
 function login() {
-  const input = document.getElementById("password-input");
-  PASSWORD = input.value;
+  PASSWORD = document.getElementById("password-input").value;
   document.getElementById("login-error").textContent = "";
   verifyAndEnter();
 }
@@ -194,10 +246,13 @@ async function verifyAndEnter() {
     const res = await fetch(`${API_BASE}/meta?password=${encodeURIComponent(PASSWORD)}`);
     if (res.status === 401) {
       document.getElementById("login-error").textContent = "Wrong password.";
+      sessionStorage.removeItem("news_app_password");
       return;
     }
     const data = await res.json();
     sessionStorage.setItem("news_app_password", PASSWORD);
+    loadPrefs();
+    buildViewChips();
     buildFilterChips(data.regions, data.sectors, data.sources);
     document.getElementById("login-screen").style.display = "none";
     document.getElementById("app").style.display = "block";
@@ -208,19 +263,45 @@ async function verifyAndEnter() {
   }
 }
 
-function buildFilterChips(regions, sectors, sources) {
-  buildChipRow("region-chips", regions, v => { currentRegion = v; loadStories(); });
-  buildChipRow("sector-chips", sectors, v => { currentSector = v; loadStories(); });
-  buildChipRow("source-chips", sources, v => { currentSource = v; loadStories(); });
+// ---------- remembered day/view choice (light convenience only) ----------
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem("news_prefs") || "{}");
+    if (DAY_OPTIONS.some(o => o[0] === p.day)) currentDay = p.day;
+    if (VIEW_OPTIONS.some(o => o[0] === p.view)) currentView = p.view;
+  } catch (e) { /* storage unavailable: keep defaults */ }
 }
 
-function buildChipRow(containerId, values, onSelect) {
+function savePrefs() {
+  try { localStorage.setItem("news_prefs", JSON.stringify({ day: currentDay, view: currentView })); }
+  catch (e) { /* ignore */ }
+}
+
+// ---------- chips ----------
+function buildViewChips() {
+  buildChipRow("day-chips", DAY_OPTIONS.map(o => o[0]), v => {
+    currentDay = v; resetHours(); savePrefs(); render();
+  }, currentDay, v => DAY_OPTIONS.find(o => o[0] === v)[1], false);
+
+  buildChipRow("view-chips", VIEW_OPTIONS.map(o => o[0]), v => {
+    currentView = v; resetHours(); savePrefs(); render();
+  }, currentView, v => VIEW_OPTIONS.find(o => o[0] === v)[1], false);
+}
+
+function buildFilterChips(regions, sectors, sources) {
+  buildChipRow("region-chips", regions, v => { currentRegion = v; flatLimit = PAGE_SIZE; resetHours(); loadStories(); }, "All", v => v, true);
+  buildChipRow("sector-chips", sectors, v => { currentSector = v; flatLimit = PAGE_SIZE; resetHours(); loadStories(); }, "All", v => v, true);
+  buildChipRow("source-chips", sources, v => { currentSource = v; flatLimit = PAGE_SIZE; resetHours(); loadStories(); }, "All", v => v, true);
+}
+
+function buildChipRow(containerId, values, onSelect, activeValue, labelOf, includeAll) {
   const row = document.getElementById(containerId);
   row.innerHTML = "";
-  ["All", ...values].forEach(v => {
+  const list = includeAll ? ["All", ...values] : values;
+  list.forEach(v => {
     const chip = document.createElement("div");
-    chip.className = "chip" + (v === "All" ? " active" : "");
-    chip.textContent = v;
+    chip.className = "chip" + (v === activeValue ? " active" : "");
+    chip.textContent = labelOf(v);
     chip.onclick = () => {
       [...row.children].forEach(c => c.classList.remove("active"));
       chip.classList.add("active");
@@ -230,87 +311,146 @@ function buildChipRow(containerId, values, onSelect) {
   });
 }
 
-function onSearchInput() {
-  clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(loadStories, 400);
+function resetHours() {
+  hoursTouched = false;
+  openHourKeys = new Set();
+  flatLimit = PAGE_SIZE;
 }
 
+function onSearchInput() {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => { resetHours(); loadStories(); }, 400);
+}
+
+// ---------- data ----------
 async function loadStories() {
   const container = document.getElementById("groups-container");
-  container.innerHTML = `<div id="loading">Loading...</div>`;
+  if (!allStories.length) container.innerHTML = `<div id="loading">Loading...</div>`;
 
-  const search = document.getElementById("search-box").value.trim();
   const params = new URLSearchParams({
     password: PASSWORD,
     region: currentRegion,
     sector: currentSector,
     source: currentSource,
-    search: search,
+    search: document.getElementById("search-box").value.trim(),
   });
 
   try {
     const res = await fetch(`${API_BASE}/articles?${params}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
-    renderGroupedStories(data.stories);
-    document.getElementById("story-count").textContent = `${data.count} stories`;
+    allStories = data.stories || [];
     document.getElementById("last-updated").textContent =
       "Last checked: " + new Date().toLocaleTimeString();
+    render();
   } catch (e) {
-    container.innerHTML = `<div id="empty">Failed to load stories.</div>`;
+    if (!allStories.length) {
+      container.innerHTML = `<div id="empty">Failed to load stories. Try Refresh Now in a moment.</div>`;
+    }
   }
 }
 
-function hourKeyAndLabel(dateObj) {
+// ---------- day filter ----------
+function dayStart(offsetDays) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + offsetDays);
+  return d.getTime();
+}
+
+function storiesForDay() {
+  if (currentDay === "all") return allStories;
+  const from = currentDay === "today" ? dayStart(0) : dayStart(-1);
+  const to = currentDay === "today" ? dayStart(1) : dayStart(0);
+  return allStories.filter(s => {
+    const t = new Date(s.published).getTime();
+    return t >= from && t < to;
+  });
+}
+
+// ---------- rendering ----------
+function render() {
+  const stories = storiesForDay();
+  const dayLabel = DAY_OPTIONS.find(o => o[0] === currentDay)[1];
+  document.getElementById("story-count").textContent = `${stories.length} stories · ${dayLabel}`;
+  document.getElementById("expand-links").classList.toggle("show", currentView === "hour");
+
+  const container = document.getElementById("groups-container");
+  const moreWrap = document.getElementById("more-wrap");
+  moreWrap.style.display = "none";
+
+  if (!stories.length) {
+    container.innerHTML = `<div id="empty">No stories match these filters${currentDay !== "all" ? " for " + dayLabel.toLowerCase() : ""}.</div>`;
+    return;
+  }
+
+  if (currentView === "hour") renderByHour(stories, container);
+  else renderFlat(stories, container, moreWrap);
+}
+
+function renderFlat(stories, container, moreWrap) {
+  const shown = stories.slice(0, flatLimit);
+  container.innerHTML = shown.map(renderStoryCard).join("");
+  if (stories.length > flatLimit) {
+    document.getElementById("more-btn").textContent =
+      `Show more (${stories.length - flatLimit} left)`;
+    moreWrap.style.display = "block";
+  }
+}
+
+function showMore() {
+  flatLimit += PAGE_SIZE;
+  render();
+}
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+function hourInfo(dateObj) {
   const start = new Date(dateObj);
   start.setMinutes(0, 0, 0);
   const end = new Date(start);
   end.setHours(end.getHours() + 1);
-  const key = start.toISOString().slice(0, 13); // groups by local-independent hour bucket key
-  const fmt = d => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  const label = `${fmt(start)} – ${fmt(end)}`;
+  const key = `${start.getFullYear()}-${pad2(start.getMonth() + 1)}-${pad2(start.getDate())}-${pad2(start.getHours())}`;
+  const fmt = d => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  let label = `${fmt(start)} – ${fmt(end)}`;
+  if (currentDay === "all") {
+    label = start.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }) + " · " + label;
+  }
   return { key, label, sortTime: start.getTime() };
 }
 
-function renderGroupedStories(stories) {
-  const container = document.getElementById("groups-container");
-  if (!stories.length) {
-    container.innerHTML = `<div id="empty">No stories match this filter yet.</div>`;
-    return;
-  }
-
-  const groups = {}; // key -> { label, sortTime, stories: [] }
+function renderByHour(stories, container) {
+  const groups = {};
   stories.forEach(s => {
-    const localDate = new Date(s.published);
-    const { key, label, sortTime } = hourKeyAndLabel(localDate);
+    const { key, label, sortTime } = hourInfo(new Date(s.published));
     if (!groups[key]) groups[key] = { label, sortTime, stories: [] };
     groups[key].stories.push(s);
   });
 
-  const sortedKeys = Object.keys(groups).sort((a, b) => groups[b].sortTime - groups[a].sortTime);
+  const keys = Object.keys(groups).sort((a, b) => groups[b].sortTime - groups[a].sortTime);
 
-  // default: only the most recent hour is open, unless the user has toggled something already
-  if (openHourKeys.size === 0) {
-    openHourKeys.add(sortedKeys[0]);
-  }
+  // Default: only the newest hour is open. Once the user opens/closes an hour
+  // themselves, their choice is kept across the 5-minute auto refresh.
+  if (!hoursTouched) openHourKeys = new Set([keys[0]]);
 
-  container.innerHTML = sortedKeys.map(key => {
-    const group = groups[key];
+  container.innerHTML = keys.map(key => {
+    const g = groups[key];
     const isOpen = openHourKeys.has(key);
     return `
       <div class="hour-group">
         <div class="hour-header" onclick="toggleHour('${key}')">
-          <span><span class="hour-arrow ${isOpen ? 'open' : ''}" id="arrow-${key}">▶</span> ${group.label}</span>
-          <span class="count">${group.stories.length} stories</span>
+          <span><span class="hour-arrow ${isOpen ? "open" : ""}" id="arrow-${key}">▶</span> ${g.label}</span>
+          <span class="count">${g.stories.length} stories</span>
         </div>
-        <div class="hour-body ${isOpen ? 'open' : ''}" id="body-${key}">
-          ${group.stories.map(renderStoryCard).join("")}
+        <div class="hour-body ${isOpen ? "open" : ""}" id="body-${key}">
+          ${g.stories.map(renderStoryCard).join("")}
         </div>
-      </div>
-    `;
+      </div>`;
   }).join("");
 }
 
 function toggleHour(key) {
+  hoursTouched = true;
   const body = document.getElementById(`body-${key}`);
   const arrow = document.getElementById(`arrow-${key}`);
   if (openHourKeys.has(key)) {
@@ -324,43 +464,58 @@ function toggleHour(key) {
   }
 }
 
+function setAllHours(open) {
+  hoursTouched = true;
+  document.querySelectorAll(".hour-group").forEach(group => {
+    const header = group.querySelector(".hour-header");
+    const key = header.getAttribute("onclick").match(/'([^']+)'/)[1];
+    if (open) openHourKeys.add(key); else openHourKeys.delete(key);
+    group.querySelector(".hour-body").classList.toggle("open", open);
+    group.querySelector(".hour-arrow").classList.toggle("open", open);
+  });
+}
+
 function renderStoryCard(s) {
   const sourceLinks = s.sources.map(src =>
-    `<a href="${src.link}" target="_blank" rel="noopener">${escapeHtml(src.name)} →</a>`
+    `<a href="${safeUrl(src.link)}" target="_blank" rel="noopener">${escapeHtml(src.name)} →</a>`
   ).join("");
 
   return `
     <div class="story">
       <div class="story-meta">
-        <span class="tag">${s.regions.join(", ")}</span>
-        <span class="tag">${s.sector}</span>
+        <span class="tag">${escapeHtml(s.regions.join(", "))}</span>
+        <span class="tag">${escapeHtml(s.sector)}</span>
         <span>${new Date(s.published).toLocaleString()}</span>
       </div>
       <div class="story-title">${escapeHtml(s.title)}</div>
       <div class="story-summary">${escapeHtml(stripHtml(s.summary))}</div>
       <div class="source-links">${sourceLinks}</div>
-    </div>
-  `;
+    </div>`;
 }
 
 function stripHtml(html) {
   const tmp = document.createElement("div");
-  tmp.innerHTML = html;
+  tmp.innerHTML = html || "";
   return tmp.textContent || tmp.innerText || "";
 }
 
 function escapeHtml(str) {
   const div = document.createElement("div");
-  div.textContent = str;
+  div.textContent = str == null ? "" : String(str);
   return div.innerHTML;
 }
 
+function safeUrl(url) {
+  return /^https?:\/\//i.test(url) ? String(url).replace(/"/g, "%22") : "#";
+}
+
+// ---------- refresh ----------
 async function manualRefresh() {
   const btn = document.getElementById("refresh-btn");
   btn.innerHTML = `<span class="spin">↻</span> Fetching...`;
   try {
     await fetch(`${API_BASE}/fetch?password=${encodeURIComponent(PASSWORD)}`, { method: "POST" });
-    openHourKeys.clear(); // reset to "only current hour open" after a fresh fetch
+    resetHours(); // back to "only the newest hour open"
     await loadStories();
   } catch (e) {
     alert("Refresh failed. Check connection.");
